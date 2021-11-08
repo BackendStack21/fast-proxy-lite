@@ -1,0 +1,54 @@
+{
+  "name": "fast-proxy-lite",
+  "version": "1.0.0",
+  "description": "Forward your HTTP request to another server.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "scripts": {
+    "lint": "npx standard",
+    "test": "nyc mocha test/*.test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:BackendStack21/fast-proxy-lite.git"
+  },
+  "keywords": [
+    "http",
+    "forward",
+    "proxy",
+    "gateway"
+  ],
+  "files": [
+    "LICENSE",
+    "README.md",
+    "index.d.ts",
+    "index.js",
+    "lib/"
+  ],
+  "author": "Rolando Santamaria Maso",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/BackendStack21/fast-proxy-lite/issues"
+  },
+  "engines": {
+    "node": ">=10.0.0"
+  },
+  "homepage": "https://github.com/BackendStack21/fast-proxy-lite",
+  "devDependencies": {
+    "0http": "^3.1.1",
+    "body-parser": "^1.19.0",
+    "chai": "^4.3.4",
+    "follow-redirects": "^1.14.5",
+    "http-proxy": "^1.18.1",
+    "mocha": "^9.1.3",
+    "nock": "^13.2.0",
+    "nyc": "^15.1.0",
+    "pem": "^1.14.4",
+    "restana": "^4.9.2",
+    "supertest": "^6.1.6"
+  },
+  "dependencies": {
+    "pump": "^3.0.0",
+    "tiny-lru": "^7.0.6"
+  }
+}
