@@ -52,8 +52,7 @@ Please see: https://github.com/jkyberneees/nodejs-proxy-benchmarks
 
 ### Options
 #### `base`
-Set the base URL for all the forwarded requests. Will be required if `http2` is set to `true`
-Note that _path will be discarded_.
+Set the base URL for all the forwarded requests.
 
 #### cacheURLs
 The number of parsed URLs that will be cached. Default: 100.
@@ -106,7 +105,6 @@ proxy(
 
 ##### base
 Optionally indicates the base URL for the current request proxy. When used, the global `base` config is overwriten.  
-> This configuration value is ignored when using HTTP2.
 
 ##### onResponse(req, res, stream)
 Called when an http response is received from the source.
