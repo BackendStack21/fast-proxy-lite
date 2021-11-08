@@ -121,13 +121,11 @@ over to the outer response.
 It must return the new headers object.
 
 ##### request
-Extended options supported by `http[s].request` method (https://nodejs.org/api/http.html#http_http_request_options_callback)
-The following options are dynamically assigned: `method, port, path, hostname, headers, agent`.  
+Extended options supported by `http[s].request` method (https://nodejs.org/api/http.html#http_http_request_options_callback)  
+> The following options are dynamically assigned: `method, port, path, hostname, headers, agent`.  
 
 ##### queryString
 Replaces the original querystring of the request with what is specified.
-This will get passed to
-[`querystring.stringify`](https://nodejs.org/api/querystring.html#querystring_querystring_stringify_obj_sep_eq_options).
 
 ## Related topics
 - http-agent: https://nodejs.org/api/http.html#http_new_agent_options
