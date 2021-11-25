@@ -14,7 +14,7 @@ const {
   populateHeaders
 } = require('./lib/utils')
 
-function fastProxy (opts = {}) {
+function fastProxy(opts = {}) {
   const { request, close } = buildRequest({
     ...opts
   })
@@ -24,7 +24,7 @@ function fastProxy (opts = {}) {
 
   return {
     close,
-    proxy (req, res, source, opts) {
+    proxy(req, res, source, opts) {
       opts = opts || {}
       const reqOpts = opts.request || {}
       const onResponse = opts.onResponse
@@ -88,18 +88,23 @@ function fastProxy (opts = {}) {
         request: reqOpts
       }
       request(reqParams, (err, response) => {
+        if (res.socket.destroyed) {
+          return
+        }
+
         if (err) {
-          if (!res.sent) {
-            if (err.code === 'ECONNREFUSED') {
-              res.statusCode = 503
-              res.end('Service Unavailable')
-            } else if (err.code === 'ECONNRESET' || err.code === 'UND_ERR_HEADERS_TIMEOUT' || err.code === 'UND_ERR_BODY_TIMEOUT') {
-              res.statusCode = 504
-              res.end(err.message)
-            } else {
-              res.statusCode = 500
-              res.end(err.message)
-            }
+          if (err.code === 'ECONNREFUSED') {
+            res.statusCode = 503
+            res.end('Service Unavailable')
+          } else if (
+            err.code === 'ECONNRESET' ||
+            err.code === 'UND_ERR_HEADERS_TIMEOUT' ||
+            err.code === 'UND_ERR_BODY_TIMEOUT') {
+            res.statusCode = 504
+            res.end(err.message)
+          } else {
+            res.statusCode = 500
+            res.end(err.message)
           }
 
           return
@@ -130,7 +135,7 @@ function fastProxy (opts = {}) {
   }
 }
 
-function getQueryString (search, reqUrl, opts) {
+function getQueryString(search, reqUrl, opts) {
   if (opts.queryString) {
     return '?' + new URLSearchParams(opts.queryString).toString()
   }
@@ -147,15 +152,15 @@ function getQueryString (search, reqUrl, opts) {
   return ''
 }
 
-function rewriteHeadersNoOp (headers) {
+function rewriteHeadersNoOp(headers) {
   return headers
 }
 
-function rewriteRequestHeadersNoOp (req, headers) {
+function rewriteRequestHeadersNoOp(req, headers) {
   return headers
 }
 
-function getCacheStorage (size) {
+function getCacheStorage(size) {
   if (size === 0) {
     return null
   }
@@ -163,7 +168,7 @@ function getCacheStorage (size) {
   return lru(size || 100)
 }
 
-function getReqUrl (source, cache, base, opts) {
+function getReqUrl(source, cache, base, opts) {
   const reqBase = opts.base || base
   let url
 
