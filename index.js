@@ -88,18 +88,23 @@ function fastProxy (opts = {}) {
         request: reqOpts
       }
       request(reqParams, (err, response) => {
+        if (res.socket.destroyed || res.writableEnded) {
+          return
+        }
+
         if (err) {
-          if (!res.sent) {
-            if (err.code === 'ECONNREFUSED') {
-              res.statusCode = 503
-              res.end('Service Unavailable')
-            } else if (err.code === 'ECONNRESET' || err.code === 'UND_ERR_HEADERS_TIMEOUT' || err.code === 'UND_ERR_BODY_TIMEOUT') {
-              res.statusCode = 504
-              res.end(err.message)
-            } else {
-              res.statusCode = 500
-              res.end(err.message)
-            }
+          if (err.code === 'ECONNREFUSED') {
+            res.statusCode = 503
+            res.end('Service Unavailable')
+          } else if (
+            err.code === 'ECONNRESET' ||
+            err.code === 'UND_ERR_HEADERS_TIMEOUT' ||
+            err.code === 'UND_ERR_BODY_TIMEOUT') {
+            res.statusCode = 504
+            res.end(err.message)
+          } else {
+            res.statusCode = 500
+            res.end(err.message)
           }
 
           return
