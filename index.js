@@ -14,7 +14,7 @@ const {
   populateHeaders
 } = require('./lib/utils')
 
-function fastProxy(opts = {}) {
+function fastProxy (opts = {}) {
   const { request, close } = buildRequest({
     ...opts
   })
@@ -24,7 +24,7 @@ function fastProxy(opts = {}) {
 
   return {
     close,
-    proxy(req, res, source, opts) {
+    proxy (req, res, source, opts) {
       opts = opts || {}
       const reqOpts = opts.request || {}
       const onResponse = opts.onResponse
@@ -90,7 +90,7 @@ function fastProxy(opts = {}) {
       request(reqParams, (err, response) => {
         if (res.socket.destroyed || res.writableEnded) {
           return
-        } 
+        }
 
         if (err) {
           if (err.code === 'ECONNREFUSED') {
@@ -135,7 +135,7 @@ function fastProxy(opts = {}) {
   }
 }
 
-function getQueryString(search, reqUrl, opts) {
+function getQueryString (search, reqUrl, opts) {
   if (opts.queryString) {
     return '?' + new URLSearchParams(opts.queryString).toString()
   }
@@ -152,15 +152,15 @@ function getQueryString(search, reqUrl, opts) {
   return ''
 }
 
-function rewriteHeadersNoOp(headers) {
+function rewriteHeadersNoOp (headers) {
   return headers
 }
 
-function rewriteRequestHeadersNoOp(req, headers) {
+function rewriteRequestHeadersNoOp (req, headers) {
   return headers
 }
 
-function getCacheStorage(size) {
+function getCacheStorage (size) {
   if (size === 0) {
     return null
   }
@@ -168,7 +168,7 @@ function getCacheStorage(size) {
   return lru(size || 100)
 }
 
-function getReqUrl(source, cache, base, opts) {
+function getReqUrl (source, cache, base, opts) {
   const reqBase = opts.base || base
   let url
 
