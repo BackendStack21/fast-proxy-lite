@@ -88,9 +88,9 @@ function fastProxy(opts = {}) {
         request: reqOpts
       }
       request(reqParams, (err, response) => {
-        if (res.socket.destroyed) {
+        if (res.socket.destroyed || res.writableEnded) {
           return
-        }
+        } 
 
         if (err) {
           if (err.code === 'ECONNREFUSED') {
