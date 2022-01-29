@@ -2,7 +2,7 @@ import * as Http from 'http';
 import * as Https from 'https';
 import { Stream } from 'pump';
 
-interface Options {
+type Options = {
   base?: string;
   cacheURLs?: number;
   requests?: {
@@ -14,6 +14,12 @@ interface Options {
   rejectUnauthorized?: boolean;
 }
 
+type ProxyRequestResponse = {
+  statusCode: Number;
+  headers: Http.OutgoingHttpHeaders;
+  stream: Stream;
+}
+
 declare function fastProxy(options?: Options): {
   proxy(
     originReq: Http.IncomingMessage,
@@ -21,6 +27,7 @@ declare function fastProxy(options?: Options): {
     source: string,
     opts?: {
       base?: string;
+      onClientConnectionTerminated?(res: Http.ServerResponse, err: Error, response: ProxyRequestResponse): void;
       onResponse?(req: Http.IncomingMessage, res: Http.ServerResponse, stream: Stream): void;
       rewriteRequestHeaders?(req: Http.IncomingMessage, headers: Http.IncomingHttpHeaders): Http.IncomingHttpHeaders;
       rewriteHeaders?(headers: Http.OutgoingHttpHeaders): Http.OutgoingHttpHeaders;
