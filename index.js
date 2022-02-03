@@ -28,6 +28,7 @@ function fastProxy (opts = {}) {
       opts = opts || {}
       const reqOpts = opts.request || {}
       const onResponse = opts.onResponse
+      const onClientConnectionTerminated = opts.onClientConnectionTerminated || onClientConnectionTerminatedNoOp
       const rewriteHeaders = opts.rewriteHeaders || rewriteHeadersNoOp
       const rewriteRequestHeaders = opts.rewriteRequestHeaders || rewriteRequestHeadersNoOp
 
@@ -88,8 +89,8 @@ function fastProxy (opts = {}) {
         request: reqOpts
       }
       request(reqParams, (err, response) => {
-        if (res.socket.destroyed || res.writableEnded) {
-          return
+        if (!res.socket || res.socket.destroyed || res.writableEnded) {
+          return onClientConnectionTerminated(res, err, response)
         }
 
         if (err) {
@@ -154,6 +155,10 @@ function getQueryString (search, reqUrl, opts) {
 
 function rewriteHeadersNoOp (headers) {
   return headers
+}
+
+function onClientConnectionTerminatedNoOp (_err, response) {
+
 }
 
 function rewriteRequestHeadersNoOp (req, headers) {

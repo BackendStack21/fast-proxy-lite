@@ -111,6 +111,15 @@ Called when an http response is received from the source.
 The default behavior is `pump(stream, res)`, which will be disabled if the
 option is specified.
 
+##### onClientConnectionTerminated(res, err, response)
+Called when the client HTTP connection to the proxy server unexpectedly terminates before the downstream service response is sent.  
+```js
+// internal implementation
+if (!res.socket || res.socket.destroyed || res.writableEnded) {
+  return onClientConnectionTerminated(res, err, response)
+}
+```
+
 ##### rewriteRequestHeaders(req, headers)
 Called to rewrite the headers of the request, before them being sent to the downstream server. 
 It must return the new headers object.
