@@ -35,17 +35,17 @@
   },
   "homepage": "https://github.com/BackendStack21/fast-proxy-lite",
   "devDependencies": {
-    "0http": "^3.4.1",
-    "body-parser": "^1.20.0",
+    "0http": "^3.5.2",
+    "body-parser": "^1.20.2",
     "chai": "^4.3.6",
-    "follow-redirects": "^1.15.2",
+    "follow-redirects": "^1.15.5",
     "http-proxy": "^1.18.1",
-    "mocha": "^10.0.0",
-    "nock": "^13.2.9",
+    "mocha": "^10.2.0",
+    "nock": "^13.5.0",
     "nyc": "^15.1.0",
     "pem": "^1.14.6",
-    "restana": "^4.9.6",
-    "supertest": "^6.2.4"
+    "restana": "^4.9.7",
+    "supertest": "^6.3.4"
   },
   "dependencies": {
     "pump": "^3.0.0",
