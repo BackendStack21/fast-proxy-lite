@@ -37,7 +37,7 @@ function fastProxy (opts = {}) {
         url = getReqUrl(source || req.url, cache, base, opts)
       } catch (err) {
         res.statusCode = 400
-        res.end(err.message)
+        res.end('Bad Request')
         return
       }
       const sourceHttp2 = req.httpVersionMajor === 2
