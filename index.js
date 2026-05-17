@@ -32,7 +32,14 @@ function fastProxy (opts = {}) {
       const rewriteHeaders = opts.rewriteHeaders || rewriteHeadersNoOp
       const rewriteRequestHeaders = opts.rewriteRequestHeaders || rewriteRequestHeadersNoOp
 
-      const url = getReqUrl(source || req.url, cache, base, opts)
+      let url
+      try {
+        url = getReqUrl(source || req.url, cache, base, opts)
+      } catch (err) {
+        res.statusCode = 400
+        res.end(err.message)
+        return
+      }
       const sourceHttp2 = req.httpVersionMajor === 2
       let headers = { ...sourceHttp2 ? filterPseudoHeaders(req.headers) : req.headers }
 
@@ -102,10 +109,10 @@ function fastProxy (opts = {}) {
             err.code === 'UND_ERR_HEADERS_TIMEOUT' ||
             err.code === 'UND_ERR_BODY_TIMEOUT') {
             res.statusCode = 504
-            res.end(err.message)
+            res.end('Gateway Timeout')
           } else {
             res.statusCode = 500
-            res.end(err.message)
+            res.end('Bad Gateway')
           }
 
           return
@@ -114,13 +121,14 @@ function fastProxy (opts = {}) {
         // destructing response from remote
         const { headers, statusCode, stream } = response
 
+        // Strip hop-by-hop headers for all responses (HTTP/1.1 and HTTP/2).
+        // Per RFC 7230 §6.1, hop-by-hop headers MUST NOT be forwarded by proxies.
+        const safeHeaders = stripHttp1ConnectionHeaders(headers)
+
         if (sourceHttp2) {
-          copyHeaders(
-            rewriteHeaders(stripHttp1ConnectionHeaders(headers)),
-            res
-          )
+          copyHeaders(rewriteHeaders(safeHeaders), res)
         } else {
-          copyHeaders(rewriteHeaders(headers), res)
+          copyHeaders(rewriteHeaders(safeHeaders), res)
         }
 
         // set origin response code
