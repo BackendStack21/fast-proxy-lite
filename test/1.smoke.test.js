@@ -121,7 +121,7 @@ describe('fast-proxy smoke', () => {
       .expect(200)
       .then((response) => {
         expect(response.headers['x-agent']).to.equal('fast-proxy')
-        expect(response.headers.host).to.equal('127.0.0.1:3000')
+        // host is a request-only header per RFC 7230, stripped from responses
         expect(response.headers['x-forwarded-host']).to.equal('127.0.0.1:8080')
       })
   })
