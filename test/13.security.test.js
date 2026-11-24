@@ -28,9 +28,8 @@ describe('Security: buildURL SSRF prevention', () => {
     expect(url.href).to.equal('http://target.com/api')
   })
 
-  it('should sanitize protocol-relative within base', () => {
-    const url = buildURL('//evil.com/hi', 'http://localhost')
-    expect(url.origin).to.equal('http://localhost')
+  it('should block protocol-relative sources', () => {
+    expect(() => buildURL('//evil.com/hi', 'http://localhost')).to.throw(/Unsafe path/)
   })
 })
 

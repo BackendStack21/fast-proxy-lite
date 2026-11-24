@@ -131,6 +131,7 @@ if (!res.socket || res.socket.destroyed || res.writableEnded) {
 ```
 - The request to the remote server is aborted as soon as the client connection is terminated. In such case `err.code` is `ECONNRESET` and `response` is `undefined`.
 - If the remote server responded anyway, `response` is defined and `err` is `null`. The response stream is destroyed right after the callback returns, unless the callback starts consuming it.
+- If the client connection was already terminated when `proxy` was invoked, nothing is sent to the remote server.
 
 ##### rewriteRequestHeaders(req, headers)
 Called to rewrite the headers of the request, before them being sent to the downstream server. 
@@ -157,7 +158,7 @@ Replaces the original querystring of the request with what is specified. Accepts
 | `req.body` | Forwarded payload | Default `content-type` |
 |---|---|---|
 | `undefined` / `null` | the request stream | - |
-| `Stream` | the given stream | - |
+| `Stream` | the given stream, using chunked transfer encoding | - |
 | `string` | as is | `text/plain` |
 | `Buffer` / typed array | as is | `application/octet-stream` |
 | object, and the request `content-type` is `application/x-www-form-urlencoded` | URL encoded | `application/x-www-form-urlencoded` |
@@ -165,7 +166,12 @@ Replaces the original querystring of the request with what is specified. Accepts
 
 > An empty object (`{}`) on a request whose payload was not consumed is considered as "not parsed" (this is what `body-parser` assigns for content types it does not handle), the request stream is forwarded instead.
 
-The `content-length`/`transfer-encoding` headers of the forwarded request are always (re)defined by the proxy, they are never copied blindly from the client request.
+The `content-length`/`transfer-encoding` headers of the forwarded request are always (re)defined by the proxy, they are never copied blindly from the client request:
+- A custom `Stream` is never framed using the `content-length` of the client request, as it does not describe it (e.g: a decompressed payload). If its length is known, `rewriteRequestHeaders` can replace `transfer-encoding` with `content-length`.
+- If `rewriteRequestHeaders` returns both headers, `content-length` is dropped.
+- `content-encoding` is not forwarded when the payload was decoded by a body parser.
+
+A `req.body` that can't be serialized (cyclic structures, `BigInt` values...) is rejected with `400 Bad Request`.
 
 ### Headers
 - Request: hop-by-hop headers (`connection`, `keep-alive`, `proxy-connection`, `proxy-authorization`, `te`, `trailer`, `transfer-encoding`, `upgrade`, `http2-settings`) and `expect` are not forwarded. `host` is set to the remote host, the original value is forwarded as `x-forwarded-host`.
@@ -176,12 +182,17 @@ The `content-length`/`transfer-encoding` headers of the forwarded request are al
 ### Request target validation
 The request is rejected with `400 Bad Request`, and nothing is sent to the remote server, when:
 - The `host` header is missing.
+- The method is not upper case. HTTP/2 servers accept `delete` as a method, HTTP clients would send it as `DELETE`.
 - The target URL can't be parsed, or its protocol is not `http:` or `https:`.
 - `base` is set and the target resolves to a different origin.
-- The target path contains `.` or `..` segments (also in their `%2e` encoded form), backslashes, tabs or line breaks. URL parsers resolve those, the path sent to the remote server would be different than the one your router and access control logic have seen (e.g: `/public/../admin` matching a `/public/*` route).
+- The target path starts with `//`, contains `.` or `..` segments (also in their `%2e` encoded form), backslashes or control characters, or the target starts/ends with a space. URL parsers rewrite those, the path sent to the remote server would be different than the one your router and access control logic have seen (e.g: `/public/../admin` matching a `/public/*` route, `//admin` not matching an `/admin` rule).
 - The request can't be represented as a valid HTTP request (e.g: invalid header values returned by `rewriteRequestHeaders`).
 
+`CONNECT` requests are rejected with `405 Method Not Allowed`.
+
 > When `base` is not set, `source` must be an absolute URL and no origin restriction applies. Never build it from untrusted input.
+
+> Anything else is forwarded as received: `/public/..;/admin`, `/public/..%2fadmin` or `/public//admin` are valid paths that reach the remote server untouched. If the remote server applies further normalization (matrix parameters, double decoding, slash merging...), access control has to take it into account.
 
 ### Errors
 | Condition | Response |
@@ -189,8 +200,11 @@ The request is rejected with `400 Bad Request`, and nothing is sent to the remot
 | Remote server refused the connection (`ECONNREFUSED`) | `503 Service Unavailable` |
 | Remote server timeout or connection reset (`ETIMEDOUT`, `ECONNRESET`) | `504 Gateway Timeout` |
 | Any other failure, including invalid responses | `502 Bad Gateway` |
+| `rewriteHeaders`, `onResponse` or `onClientConnectionTerminated` threw | `500 Internal Server Error` |
 
-If the remote server fails after the response headers were sent to the client, the client connection is terminated so the response is not mistaken with a complete one.
+If the remote server fails after the response headers were sent to the client, the client connection (HTTP/2: the stream) is terminated so the response is not mistaken with a complete one.
+
+Errors thrown by `rewriteHeaders`, `onResponse` and `onClientConnectionTerminated` can't be propagated to the caller, they are reported using [`process.emitWarning`](https://nodejs.org/api/process.html#processemitwarningwarning-options). Errors thrown by `rewriteRequestHeaders` are propagated to the caller of `proxy`.
 
 ## Related topics
 - http-agent: https://nodejs.org/api/http.html#http_new_agent_options

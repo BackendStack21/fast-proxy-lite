@@ -20,6 +20,7 @@ const {
 const { createError } = buildRequest
 
 const LOWER_CASE = /[a-z]/
+const NGHTTP2_INTERNAL_ERROR = 0x02
 
 function fastProxy (opts = {}) {
   const { request, close } = buildRequest({
@@ -108,24 +109,20 @@ function fastProxy (opts = {}) {
           body = req
         } else if (body instanceof Stream) {
           // forwarded as is
-        } else if (typeof body === 'string') {
-          populateHeaders(headers, body, 'text/plain')
-        } else if (Buffer.isBuffer(body)) {
-          populateHeaders(headers, body, 'application/octet-stream')
-        } else if (ArrayBuffer.isView(body)) {
-          body = Buffer.from(body.buffer, body.byteOffset, body.byteLength)
-          populateHeaders(headers, body, 'application/octet-stream')
         } else if (typeof body === 'object' && req.readableEnded === false && isEmptyPlainObject(body)) {
           // body parsers commonly assign an empty object as "req.body" when the
           // request payload was not parsed (e.g: unsupported content-type), in
           // such case the payload is still unread and has to be streamed
           body = req
-        } else if (typeof body === 'object' && isFormUrlEncoded(headers['content-type'])) {
-          body = toFormUrlEncoded(body)
-          populateHeaders(headers, body, 'application/x-www-form-urlencoded')
         } else {
-          body = JSON.stringify(body) || ''
-          populateHeaders(headers, body, 'application/json')
+          try {
+            body = serializeBody(body, headers, reqHeaders)
+          } catch (err) {
+            // the payload can't be serialized: BigInt values, cyclic structures...
+            sendError(res, 400, 'Bad Request')
+
+            return
+          }
         }
 
         if (body instanceof Stream) {
@@ -134,7 +131,14 @@ function fastProxy (opts = {}) {
           // a request with neither "content-length" nor "transfer-encoding"
           // is sent unframed, and would be parsed as a second (smuggled)
           // request by the remote server.
-          if (body === req && req.readableEnded === true) {
+          if (body !== req) {
+            // The framing headers of the client request describe the client
+            // payload, not this stream (e.g: a decompressed version of it).
+            // Bytes exceeding a wrong content-length would be parsed as a
+            // second request by the remote server.
+            headers['transfer-encoding'] = 'chunked'
+            streaming = true
+          } else if (req.readableEnded === true) {
             // an already consumed request has nothing left to forward
             body = null
           } else if (reqHeaders['transfer-encoding'] !== undefined) {
@@ -144,7 +148,7 @@ function fastProxy (opts = {}) {
           } else if (isValidContentLength(reqHeaders['content-length'])) {
             headers['content-length'] = reqHeaders['content-length']
             streaming = true
-          } else if (body === req && !sourceHttp2) {
+          } else if (!sourceHttp2) {
             // an HTTP/1 request with no framing headers has no payload
             body = null
           } else {
@@ -155,7 +159,12 @@ function fastProxy (opts = {}) {
       }
 
       headers = rewriteRequestHeaders(req, headers) || headers
-      if (streaming && !hasFramingHeaders(headers)) {
+      if (headers['transfer-encoding'] !== undefined) {
+        // both headers must never be sent, "transfer-encoding" takes precedence
+        if (headers['content-length'] !== undefined) {
+          delete headers['content-length']
+        }
+      } else if (streaming && !hasFramingHeaders(headers)) {
         headers['transfer-encoding'] = 'chunked'
       }
 
@@ -174,67 +183,84 @@ function fastProxy (opts = {}) {
         abort = request(reqParams, (err, response) => {
           settled = true
 
-          if (isClientGone(res)) {
-            onClientConnectionTerminated(res, err, response)
+          try {
+            if (isClientGone(res)) {
+              try {
+                onClientConnectionTerminated(res, err, response)
+              } finally {
+                // an unconsumed response would hold the remote connection forever
+                if (response && response.stream && response.stream.readableFlowing === null) {
+                  response.stream.destroy()
+                }
+              }
 
-            // an unconsumed response would hold the remote connection forever
-            if (response && response.stream && response.stream.readableFlowing === null) {
+              return
+            }
+
+            if (err) {
+              if (err.code === 'ECONNREFUSED') {
+                sendError(res, 503, 'Service Unavailable')
+              } else if (
+                err.code === 'ECONNRESET' ||
+                err.code === 'ETIMEDOUT' ||
+                err.code === 'ESOCKETTIMEDOUT' ||
+                err.code === 'UND_ERR_HEADERS_TIMEOUT' ||
+                err.code === 'UND_ERR_BODY_TIMEOUT') {
+                sendError(res, 504, 'Gateway Timeout')
+              } else {
+                sendError(res, 502, 'Bad Gateway')
+              }
+
+              return
+            }
+
+            // destructing response from remote
+            const { headers, statusCode, stream } = response
+
+            if (!isValidStatusCode(statusCode)) {
+              stream.destroy()
+              sendError(res, 502, 'Bad Gateway')
+
+              return
+            }
+
+            // Strip hop-by-hop headers for all responses (HTTP/1.1 and HTTP/2).
+            // Per RFC 7230 §6.1, hop-by-hop headers MUST NOT be forwarded by proxies.
+            const safeHeaders = stripHttp1ConnectionHeaders(headers)
+            const resHeaders = rewriteHeaders(safeHeaders) || safeHeaders
+
+            try {
+              // set origin response code
+              res.statusCode = statusCode
+              copyHeaders(resHeaders, res)
+            } catch (err) {
+              // the remote response can't be represented to the client, e.g:
+              // invalid header values, status codes not allowed in HTTP/2
+              stream.destroy()
+              removeHeaders(resHeaders, res)
+              sendError(res, 502, 'Bad Gateway')
+
+              return
+            }
+
+            if (onResponse) {
+              onResponse(req, res, stream)
+            } else {
+              if (sourceHttp2) {
+                resetHttp2StreamOnFailure(stream, res)
+              }
+              pump(stream, res)
+            }
+          } catch (err) {
+            // A hook threw. This callback runs outside of the caller stack, the
+            // error can't be propagated: it would be an uncaught exception.
+            if (response && response.stream && !response.stream.destroyed) {
               response.stream.destroy()
             }
-
-            return
-          }
-
-          if (err) {
-            if (err.code === 'ECONNREFUSED') {
-              sendError(res, 503, 'Service Unavailable')
-            } else if (
-              err.code === 'ECONNRESET' ||
-              err.code === 'ETIMEDOUT' ||
-              err.code === 'ESOCKETTIMEDOUT' ||
-              err.code === 'UND_ERR_HEADERS_TIMEOUT' ||
-              err.code === 'UND_ERR_BODY_TIMEOUT') {
-              sendError(res, 504, 'Gateway Timeout')
-            } else {
-              sendError(res, 502, 'Bad Gateway')
+            if (!isClientGone(res)) {
+              sendError(res, 500, 'Internal Server Error')
             }
-
-            return
-          }
-
-          // destructing response from remote
-          const { headers, statusCode, stream } = response
-
-          if (!isValidStatusCode(statusCode)) {
-            stream.destroy()
-            sendError(res, 502, 'Bad Gateway')
-
-            return
-          }
-
-          // Strip hop-by-hop headers for all responses (HTTP/1.1 and HTTP/2).
-          // Per RFC 7230 §6.1, hop-by-hop headers MUST NOT be forwarded by proxies.
-          const safeHeaders = stripHttp1ConnectionHeaders(headers)
-          const resHeaders = rewriteHeaders(safeHeaders) || safeHeaders
-
-          try {
-            // set origin response code
-            res.statusCode = statusCode
-            copyHeaders(resHeaders, res)
-          } catch (err) {
-            // the remote response can't be represented to the client, e.g:
-            // invalid header values, status codes not allowed in HTTP/2
-            stream.destroy()
-            removeHeaders(resHeaders, res)
-            sendError(res, 502, 'Bad Gateway')
-
-            return
-          }
-
-          if (onResponse) {
-            onResponse(req, res, stream)
-          } else {
-            pump(stream, res)
+            process.emitWarning(err instanceof Error ? err : String(err))
           }
         })
       } catch (err) {
@@ -279,6 +305,53 @@ function getQueryString (search, reqUrl, opts) {
   }
 
   return ''
+}
+
+function serializeBody (body, headers, reqHeaders) {
+  if (typeof body === 'string') {
+    populateHeaders(headers, body, 'text/plain')
+  } else if (Buffer.isBuffer(body) || ArrayBuffer.isView(body)) {
+    if (!Buffer.isBuffer(body)) {
+      body = Buffer.from(body.buffer, body.byteOffset, body.byteLength)
+    }
+    populateHeaders(headers, body, 'application/octet-stream')
+
+    // Raw payloads are either untouched, or decoded by the body parser. The
+    // "content-encoding" header only applies to the former, in which case the
+    // payload length still matches the one announced by the client.
+    const contentLength = reqHeaders['content-length']
+    if (!isValidContentLength(contentLength) || Number(contentLength) === body.length) {
+      return body
+    }
+  } else if (typeof body === 'object' && isFormUrlEncoded(headers['content-type'])) {
+    body = toFormUrlEncoded(body)
+    populateHeaders(headers, body, 'application/x-www-form-urlencoded')
+  } else {
+    body = JSON.stringify(body) || ''
+    populateHeaders(headers, body, 'application/json')
+  }
+
+  // the payload was decoded by a body parser, it is forwarded as plain content
+  if (headers['content-encoding'] !== undefined) {
+    delete headers['content-encoding']
+  }
+
+  return body
+}
+
+// When the remote response fails midway, the HTTP/2 stream has to be reset.
+// Destroying the response (what pump does) ends the stream gracefully, the
+// client would not be able to tell that the payload is incomplete.
+function resetHttp2StreamOnFailure (stream, res) {
+  const reset = () => {
+    const http2Stream = res.stream
+    if (http2Stream && !http2Stream.destroyed) {
+      http2Stream.close(NGHTTP2_INTERNAL_ERROR)
+    }
+  }
+
+  stream.once('aborted', reset)
+  stream.once('error', reset)
 }
 
 function hasFramingHeaders (headers) {

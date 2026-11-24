@@ -101,6 +101,18 @@ describe('Hardening: request target validation', () => {
     }
   })
 
+  it('should reject multiple leading slashes', () => {
+    for (const source of ['//admin', '///admin/secret', '//evil.com/x', '//']) {
+      expect(() => buildURL(source, 'http://localhost'), source).to.throw(/Unsafe path/)
+    }
+  })
+
+  it('should reject control characters and surrounding spaces', () => {
+    for (const source of ['/public/..\f', '/public/..\v', '/public/..\x00', '/public/..\x1f', '/public/.. ', ' /public', '/pub\x7flic']) {
+      expect(() => buildURL(source, 'http://localhost'), JSON.stringify(source)).to.throw(/Unsafe path/)
+    }
+  })
+
   it('should not reject safe paths', () => {
     const sources = {
       '/.well-known/security.txt': '/.well-known/security.txt',
@@ -112,6 +124,8 @@ describe('Hardening: request target validation', () => {
       '/a#/../b': '/a',
       '/a%2f..%2fb': '/a%2f..%2fb',
       '/a%5c..%5cb': '/a%5c..%5cb',
+      '/a//b': '/a//b',
+      '/a b/.. c': '/a%20b/..%20c',
       '': '/'
     }
     for (const source of Object.keys(sources)) {
@@ -233,8 +247,8 @@ describe('Hardening: utils', () => {
   })
 
   it('should serialize form urlencoded payloads', () => {
-    expect(utils.toFormUrlEncoded({ a: '1', b: ['2', '3'], c: { d: 'x y', e: { f: true } }, g: null, h: [{ i: 1 }] }))
-      .to.equal('a=1&b=2&b=3&c%5Bd%5D=x+y&c%5Be%5D%5Bf%5D=true&g=&h%5B0%5D%5Bi%5D=1')
+    expect(utils.toFormUrlEncoded({ a: '1', b: ['2', '3'], c: { d: 'x y', e: { f: true } }, g: null, h: [{ i: 1 }], j: new Date(0) }))
+      .to.equal('a=1&b=2&b=3&c%5Bd%5D=x+y&c%5Be%5D%5Bf%5D=true&g=&h%5B0%5D%5Bi%5D=1&j=1970-01-01T00%3A00%3A00.000Z')
   })
 
   it('should not overflow on cyclic form payloads', () => {
@@ -316,7 +330,7 @@ describe('Hardening: route prefix escape', () => {
     const servicePort = await listen(service);
     ({ proxy, close } = fastProxy({ base: 'http://127.0.0.1:' + servicePort }))
     gateway = http.createServer((req, res) => {
-      if (!req.url.startsWith('/public/')) {
+      if (req.url.startsWith('/admin') || (!req.url.startsWith('/public/') && !req.url.startsWith('//'))) {
         res.statusCode = 403
         res.end()
       } else {
@@ -339,7 +353,9 @@ describe('Hardening: route prefix escape', () => {
       '/public/.%2E/admin',
       '/public/x/..\\..\\admin',
       '/public/./../admin',
-      '/public/x/../../admin?a=1'
+      '/public/x/../../admin?a=1',
+      '//admin',
+      '///admin/secret'
     ]
     for (const target of targets) {
       const res = await raw(port, `GET ${target} HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n`)
@@ -493,6 +509,28 @@ describe('Hardening: request headers and framing (HTTP/1 source)', () => {
     expect(body).to.equal('\x00\x01\xfe\xff')
   })
 
+  it('should not forward content-encoding of payloads decoded by the body parsers', async () => {
+    const zlib = require('zlib')
+    const json = zlib.gzipSync('{"hello":"world"}').toString('latin1')
+    const parsed = await send(parsedPort, `POST /x HTTP/1.1\r\nHost: a\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: ${json.length}\r\n\r\n${json}`)
+
+    expect(parsed.head).to.not.include('content-encoding')
+    expect(parsed.head).to.include('content-length: 17')
+    expect(parsed.body).to.equal('{"hello":"world"}')
+
+    const binary = zlib.gzipSync('binary payload').toString('latin1')
+    const raw = await send(parsedPort, `POST /x HTTP/1.1\r\nHost: a\r\nConnection: close\r\nContent-Type: application/octet-stream\r\nContent-Encoding: gzip\r\nContent-Length: ${binary.length}\r\n\r\n${binary}`)
+
+    expect(raw.head).to.not.include('content-encoding')
+    expect(raw.body).to.equal('binary payload')
+
+    // not decoded: streamed as received
+    const streamed = await send(port, `POST /x HTTP/1.1\r\nHost: a\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: ${json.length}\r\n\r\n${json}`)
+
+    expect(streamed.head).to.include('content-encoding: gzip')
+    expect(streamed.body).to.equal(json)
+  })
+
   it('should stream payloads the body parsers did not handle', async () => {
     const { head, body } = await send(parsedPort, 'POST /x HTTP/1.1\r\nHost: a\r\nConnection: close\r\nContent-Type: text/xml\r\nContent-Length: 8\r\n\r\n<a>1</a>')
 
@@ -576,17 +614,77 @@ describe('Hardening: request body shapes', () => {
     expect(body).to.equal('0')
   })
 
-  it('should forward custom streams using chunked encoding when the length is unknown', async () => {
+  it('should never frame custom streams using the client content-length', async () => {
+    // e.g: a decompressed version of the client payload, the client
+    // content-length (5) does not describe it
+    const smuggled = 'hello' + 'GET /admin HTTP/1.1\r\nHost: internal\r\n\r\n'
     const { head, body } = await send((req, next) => {
-      delete req.headers['content-length']
       req.body = new PassThrough()
-      req.body.end('custom')
+      req.body.end(smuggled)
       next()
     })
 
     expect(head).to.include('transfer-encoding: chunked')
     expect(head).to.not.include('content-length')
-    expect(body).to.equal('6\r\ncustom\r\n0\r\n\r\n')
+    expect(body).to.equal(smuggled.length.toString(16) + '\r\n' + smuggled + '\r\n0\r\n\r\n')
+  })
+
+  it('should let hooks define the length of custom streams', async () => {
+    const { head, body } = await send((req, next) => {
+      req.body = new PassThrough()
+      req.body.end('custom')
+      next()
+    }, {
+      rewriteRequestHeaders: (req, headers) => {
+        delete headers['transfer-encoding']
+        headers['content-length'] = '6'
+
+        return headers
+      }
+    })
+
+    expect(head).to.include('content-length: 6')
+    expect(head).to.not.include('transfer-encoding')
+    expect(body).to.equal('custom')
+  })
+
+  it('should never send both framing headers when a hook adds transfer-encoding', async () => {
+    const { head, body } = await send((req, next) => next(), {
+      rewriteRequestHeaders: (req, headers) => {
+        headers['transfer-encoding'] = 'chunked'
+
+        return headers
+      }
+    })
+
+    expect(head).to.include('transfer-encoding: chunked')
+    expect(head).to.not.include('content-length')
+    expect(body).to.equal('5\r\nhello\r\n0\r\n\r\n')
+  })
+
+  it('should keep content-encoding of raw payloads that were not decoded', async () => {
+    const { head, body } = await send((req, next) => {
+      req.headers['content-encoding'] = 'gzip'
+      req.body = Buffer.from('12345')
+      next()
+    })
+
+    expect(head).to.include('content-encoding: gzip')
+    expect(body).to.equal('12345')
+  })
+
+  it('should 400 on payloads that can not be serialized', async () => {
+    const cyclic = {}
+    cyclic.self = cyclic
+    for (const payload of [{ id: BigInt(10) }, cyclic, { toJSON () { throw new Error('boom') } }]) {
+      const { res } = await send((req, next) => {
+        req.body = payload
+        next()
+      })
+
+      expect(res.status).to.equal(400)
+      expect(remote.wire).to.equal('')
+    }
   })
 
   it('should not send a payload when the request was already consumed', async () => {
@@ -743,6 +841,42 @@ describe('Hardening: request smuggling (HTTP/2 source)', () => {
 
       expect(res[':status'], statusLine).to.equal(502)
       expect(res['x-remote'], statusLine).to.equal(undefined)
+
+      close()
+      await new Promise(resolve => client.close(resolve))
+      await closeServer(gateway)
+      await closeServer(remote)
+    }
+  })
+
+  it('should reset the stream when the remote response is truncated', async () => {
+    const replies = [
+      'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n',
+      'HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nhello'
+    ]
+    for (const reply of replies) {
+      const remote = track(net.createServer(socket => {
+        socket.on('error', () => {})
+        socket.once('data', () => {
+          socket.write(reply)
+          setTimeout(() => socket.destroy(), 50)
+        })
+      }))
+      const { proxy, close } = fastProxy({ base: 'http://127.0.0.1:' + await listen(remote) })
+      const gateway = http2.createServer((req, res) => proxy(req, res, req.url, {}))
+      const client = http2.connect('http://127.0.0.1:' + await listen(gateway))
+      const res = await new Promise(resolve => {
+        const req = client.request({ ':path': '/x' })
+        let body = ''
+        let error = null
+        req.on('data', chunk => { body += chunk })
+        req.on('error', err => { error = err })
+        req.on('close', () => resolve({ body, error, rstCode: req.rstCode }))
+      })
+
+      expect(res.body, reply).to.equal('hello')
+      expect(res.rstCode, reply).to.not.equal(0)
+      expect(res.error, reply).to.not.equal(null)
 
       close()
       await new Promise(resolve => client.close(resolve))
@@ -1003,6 +1137,85 @@ describe('Hardening: remote response received after the client is gone', () => {
     expect(terminated.length).to.equal(1)
     expect(ended).to.equal(true)
     expect(received).to.equal('payload')
+  })
+})
+
+describe('Hardening: failing hooks', () => {
+  let gateway, remote, port, proxy, close, proxyOpts, warnings, remoteClosed
+
+  const onWarning = warning => warnings.push(warning)
+
+  before(async () => {
+    remote = http.createServer((req, res) => {
+      req.socket.once('close', () => { remoteClosed++ })
+      res.end(Buffer.alloc(1024 * 1024))
+    })
+    const remotePort = await listen(remote);
+    ({ proxy, close } = fastProxy({ base: 'http://127.0.0.1:' + remotePort }))
+    gateway = http.createServer((req, res) => proxy(req, res, req.url, proxyOpts))
+    port = await listen(gateway)
+    process.on('warning', onWarning)
+  })
+
+  after(async () => {
+    process.removeListener('warning', onWarning)
+    close()
+    await closeServer(gateway)
+    await closeServer(remote)
+  })
+
+  async function send (opts, timeout) {
+    warnings = []
+    remoteClosed = 0
+    proxyOpts = opts
+    const res = await raw(port, 'GET /x HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n', timeout)
+    await sleep(100)
+
+    return res
+  }
+
+  it('should 500 when rewriteHeaders throws', async () => {
+    const res = await send({ rewriteHeaders: () => { throw new Error('boom rewriteHeaders') } })
+
+    expect(res.status).to.equal(500)
+    expect(res.body).to.equal('Internal Server Error')
+    expect(remoteClosed).to.equal(1)
+    expect(warnings.map(w => w.message)).to.deep.equal(['boom rewriteHeaders'])
+  })
+
+  it('should 500 when onResponse throws', async () => {
+    const res = await send({ onResponse: () => { throw new Error('boom onResponse') } })
+
+    expect(res.status).to.equal(500)
+    expect(remoteClosed).to.equal(1)
+    expect(warnings.map(w => w.message)).to.deep.equal(['boom onResponse'])
+  })
+
+  it('should release the remote connection when onClientConnectionTerminated throws', async () => {
+    const stream = new PassThrough()
+    stream.statusCode = 200
+    stream.headers = {}
+    const client = {
+      request () {
+        const req = new EventEmitter()
+        req.end = () => process.nextTick(() => req.emit('response', stream))
+        req.destroy = () => {}
+
+        return req
+      }
+    }
+    const { proxy, close } = fastProxy({ base: 'http://example.com', requests: { http: client } })
+    const gateway = http.createServer((req, res) => {
+      proxy(req, res, req.url, { onClientConnectionTerminated: () => { throw 'boom terminated' } }) // eslint-disable-line no-throw-literal
+      res.socket.destroy()
+    })
+    warnings = []
+    await raw(await listen(gateway), 'GET /x HTTP/1.1\r\nHost: a\r\n\r\n', 200)
+    close()
+    await closeServer(gateway)
+
+    expect(stream.destroyed).to.equal(true)
+    expect(warnings.map(w => w.message)).to.deep.equal(['boom terminated'])
   })
 })
 
