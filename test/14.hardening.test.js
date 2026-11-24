@@ -284,6 +284,24 @@ describe('Hardening: invalid targets do not crash the process', () => {
     }
   })
 
+  it('should 405 on CONNECT', async () => {
+    const { proxy, close } = fastProxy({ base: 'http://127.0.0.1:1' })
+    const gateway = http.createServer()
+    // CONNECT requests are not emitted as regular requests by the http server
+    gateway.on('connect', (req, socket) => {
+      const res = new http.ServerResponse(req)
+      res.assignSocket(socket)
+      res.on('finish', () => socket.end())
+      proxy(req, res, '/x', {})
+    })
+    const res = await raw(await listen(gateway), 'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n')
+
+    expect(res.status).to.equal(405)
+
+    close()
+    await closeServer(gateway)
+  })
+
   it('should 400 on relative source when base is not set', async () => {
     const res = await raw(port, 'GET /hi HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n')
     expect(res.status).to.equal(400)
@@ -698,6 +716,41 @@ describe('Hardening: request smuggling (HTTP/2 source)', () => {
     expect(body).to.equal('hello')
   })
 
+  it('should reject methods that are not upper case', async () => {
+    for (const method of ['delete', 'Delete', 'get', 'post', 'connect']) {
+      const res = await send({ ':method': method, ':path': '/x' })
+
+      expect(res.status, method).to.equal(400)
+      expect(res.wire, method).to.equal('')
+    }
+  })
+
+  it('should 502 on remote status codes not allowed in HTTP/2', async () => {
+    for (const statusLine of ['HTTP/1.1 600 Weird', 'HTTP/1.1 999 Weird']) {
+      const remote = track(net.createServer(socket => {
+        socket.on('error', () => {})
+        socket.once('data', () => socket.end(statusLine + '\r\nContent-Length: 2\r\nX-Remote: 1\r\n\r\nok'))
+      }))
+      const { proxy, close } = fastProxy({ base: 'http://127.0.0.1:' + await listen(remote) })
+      const gateway = http2.createServer((req, res) => proxy(req, res, req.url, {}))
+      const client = http2.connect('http://127.0.0.1:' + await listen(gateway))
+      const res = await new Promise((resolve, reject) => {
+        const req = client.request({ ':path': '/x' })
+        req.on('response', headers => resolve(headers))
+        req.on('error', reject)
+        req.resume()
+      })
+
+      expect(res[':status'], statusLine).to.equal(502)
+      expect(res['x-remote'], statusLine).to.equal(undefined)
+
+      close()
+      await new Promise(resolve => client.close(resolve))
+      await closeServer(gateway)
+      await closeServer(remote)
+    }
+  })
+
   it('should build host from :authority and strip connection headers from the response', async () => {
     const res = await send({ ':method': 'GET', ':path': '/x?a=1' })
 
@@ -870,33 +923,86 @@ describe('Hardening: client connection terminated', () => {
     expect(terminated[0].response).to.equal(undefined)
   })
 
-  it('should release the remote connection when the response is not consumed', async () => {
+  it('should not forward requests of clients that are already gone', async () => {
     reset()
     await raw(port, 'GET /late HTTP/1.1\r\nHost: a\r\n\r\n', 50)
-    await sleep(300)
+    await raw(port, 'POST /late HTTP/1.1\r\nHost: a\r\nContent-Length: 100\r\n\r\nhello', 50)
+    await sleep(200)
 
-    expect(remoteRequests).to.equal(1)
+    expect(remoteRequests).to.equal(0)
+    expect(terminated.length).to.equal(2)
+    expect(terminated[0].err.code).to.equal('ECONNRESET')
+    expect(terminated[0].response).to.equal(undefined)
+  })
+
+  it('should abort the remote request when the client goes away while uploading', async () => {
+    reset()
+    await raw(port, 'POST /slow HTTP/1.1\r\nHost: a\r\nContent-Length: 100\r\n\r\nhello', 100)
+    await sleep(200)
+
+    expect(remoteClosed).to.equal(remoteRequests)
+    expect(terminated.length).to.equal(1)
+  })
+})
+
+describe('Hardening: remote response received after the client is gone', () => {
+  // the client connection is destroyed right after the request is forwarded,
+  // the remote response is received before the 'close' event is emitted
+  async function run (hook) {
+    const stream = new PassThrough()
+    stream.statusCode = 200
+    stream.headers = {}
+    const client = {
+      request () {
+        const req = new EventEmitter()
+        req.end = () => process.nextTick(() => {
+          req.emit('response', stream)
+          stream.end('payload')
+        })
+        req.destroy = () => {}
+
+        return req
+      }
+    }
+    const terminated = []
+    const { proxy, close } = fastProxy({ base: 'http://example.com', requests: { http: client } })
+    const gateway = http.createServer((req, res) => {
+      proxy(req, res, req.url, {
+        onClientConnectionTerminated: (res, err, response) => {
+          terminated.push({ err, response })
+          if (hook) hook(response)
+        }
+      })
+      res.socket.destroy()
+    })
+    const port = await listen(gateway)
+    await raw(port, 'GET /x HTTP/1.1\r\nHost: a\r\n\r\n', 200)
+    close()
+    await closeServer(gateway)
+
+    return { terminated, stream }
+  }
+
+  it('should destroy the response when it is not consumed', async () => {
+    const { terminated, stream } = await run()
+
     expect(terminated.length).to.equal(1)
     expect(terminated[0].err).to.equal(null)
     expect(terminated[0].response.statusCode).to.equal(200)
-    expect(terminated[0].response.stream.destroyed).to.equal(true)
-    expect(remoteClosed).to.equal(1)
+    expect(stream.destroyed).to.equal(true)
   })
 
   it('should not destroy the response when the hook consumes it', async () => {
-    reset()
-    let received = 0
+    let received = ''
     let ended = false
-    hook = response => {
-      response.stream.on('data', chunk => { received += chunk.length })
+    const { terminated } = await run(response => {
+      response.stream.on('data', chunk => { received += chunk })
       response.stream.on('end', () => { ended = true })
-    }
-    await raw(port, 'GET /late HTTP/1.1\r\nHost: a\r\n\r\n', 50)
-    await sleep(300)
+    })
 
     expect(terminated.length).to.equal(1)
     expect(ended).to.equal(true)
-    expect(received).to.equal(1024 * 1024)
+    expect(received).to.equal('payload')
   })
 })
 

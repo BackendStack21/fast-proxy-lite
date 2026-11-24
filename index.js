@@ -19,6 +19,8 @@ const {
 
 const { createError } = buildRequest
 
+const LOWER_CASE = /[a-z]/
+
 function fastProxy (opts = {}) {
   const { request, close } = buildRequest({
     ...opts
@@ -37,6 +39,31 @@ function fastProxy (opts = {}) {
       const onClientConnectionTerminated = opts.onClientConnectionTerminated || onClientConnectionTerminatedNoOp
       const rewriteHeaders = opts.rewriteHeaders || rewriteHeadersNoOp
       const rewriteRequestHeaders = opts.rewriteRequestHeaders || rewriteRequestHeadersNoOp
+
+      if (isClientGone(res)) {
+        // nobody is waiting for a response, e.g: the client went away while
+        // asynchronous middlewares were running. The 'close' event was
+        // already emitted, the remote request could not be aborted later on.
+        onClientConnectionTerminated(res, createError('Client connection terminated', 'ECONNRESET'))
+
+        return
+      }
+
+      const method = req.method
+      if (method === 'CONNECT') {
+        // tunnels are not supported
+        sendError(res, 405, 'Method Not Allowed')
+
+        return
+      }
+      if (LOWER_CASE.test(method)) {
+        // Methods are case-sensitive, but http clients send them in upper case.
+        // HTTP/2 servers do accept "delete" as a method name: forwarding it as
+        // "DELETE" would bypass any method based access control.
+        sendError(res, 400, 'Bad Request')
+
+        return
+      }
 
       let url
       try {
@@ -75,7 +102,7 @@ function fastProxy (opts = {}) {
       // according to https://tools.ietf.org/html/rfc2616#section-4.3
       // proxy should ignore message body when it's a GET or HEAD request
       // when proxy this request, the message framing headers are not forwarded to make it a valid http request
-      if (req.method !== 'GET' && req.method !== 'HEAD') {
+      if (method !== 'GET' && method !== 'HEAD') {
         body = req.body
         if (body === undefined || body === null) {
           body = req
@@ -133,7 +160,7 @@ function fastProxy (opts = {}) {
       }
 
       const reqParams = {
-        method: req.method,
+        method,
         url,
         qs: getQueryString(url.search, req.url, opts),
         headers,
@@ -147,7 +174,7 @@ function fastProxy (opts = {}) {
         abort = request(reqParams, (err, response) => {
           settled = true
 
-          if (!res.socket || res.socket.destroyed || res.writableEnded) {
+          if (isClientGone(res)) {
             onClientConnectionTerminated(res, err, response)
 
             // an unconsumed response would hold the remote connection forever
@@ -191,18 +218,18 @@ function fastProxy (opts = {}) {
           const resHeaders = rewriteHeaders(safeHeaders) || safeHeaders
 
           try {
+            // set origin response code
+            res.statusCode = statusCode
             copyHeaders(resHeaders, res)
           } catch (err) {
-            // the remote response can't be represented to the client
+            // the remote response can't be represented to the client, e.g:
+            // invalid header values, status codes not allowed in HTTP/2
             stream.destroy()
             removeHeaders(resHeaders, res)
             sendError(res, 502, 'Bad Gateway')
 
             return
           }
-
-          // set origin response code
-          res.statusCode = statusCode
 
           if (onResponse) {
             onResponse(req, res, stream)
@@ -270,6 +297,10 @@ function hasFramingHeaders (headers) {
   }
 
   return false
+}
+
+function isClientGone (res) {
+  return !res.socket || res.socket.destroyed || res.writableEnded
 }
 
 function isValidStatusCode (statusCode) {
