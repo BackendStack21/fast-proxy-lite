@@ -1,15 +1,22 @@
 name: tests
 on: [push, pull_request]
 
+permissions:
+  contents: read
+
 jobs:
   testing:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18.x, 20.x, 22.x, 24.x]
     steps:
-      - uses: actions/checkout@v1
-      - name: Setup Environment (Using NodeJS 16.x)
-        uses: actions/setup-node@v1
+      - uses: actions/checkout@v4
+      - name: Setup Environment (Using NodeJS ${{ matrix.node-version }})
+        uses: actions/setup-node@v4
         with:
-          node-version: 16.x
+          node-version: ${{ matrix.node-version }}
 
       - name: Install dependencies
         run: npm install
