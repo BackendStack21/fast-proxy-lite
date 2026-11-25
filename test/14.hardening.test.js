@@ -33,6 +33,13 @@ function closeServer (server) {
   })
 }
 
+// echoes request data as plain text, never as markup
+function echo (res, text) {
+  res.setHeader('content-type', 'text/plain; charset=utf-8')
+  res.setHeader('x-content-type-options', 'nosniff')
+  res.end(text)
+}
+
 function sleep (ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
@@ -326,7 +333,7 @@ describe('Hardening: route prefix escape', () => {
   let gateway, service, port, proxy, close
 
   before(async () => {
-    service = http.createServer((req, res) => res.end(req.url))
+    service = http.createServer((req, res) => echo(res, req.url))
     const servicePort = await listen(service);
     ({ proxy, close } = fastProxy({ base: 'http://127.0.0.1:' + servicePort }))
     gateway = http.createServer((req, res) => {
@@ -1377,7 +1384,7 @@ describe('Hardening: query string and URL cache', () => {
   let gateway, service, port, proxy, close, servicePort, handler
 
   before(async () => {
-    service = http.createServer((req, res) => res.end(req.headers.host + req.url))
+    service = http.createServer((req, res) => echo(res, req.headers.host + req.url))
     servicePort = await listen(service);
     ({ proxy, close } = fastProxy({ base: 'http://127.0.0.1:' + servicePort }))
     gateway = http.createServer((req, res) => handler(req, res))
@@ -1419,7 +1426,7 @@ describe('Hardening: query string and URL cache', () => {
   })
 
   it('should not mix cached URLs of different bases', async () => {
-    const other = http.createServer((req, res) => res.end('other' + req.url))
+    const other = http.createServer((req, res) => echo(res, 'other' + req.url))
     const otherPort = await listen(other)
     const globalBase = 'http://127.0.0.1:' + servicePort
     const otherBase = 'http://127.0.0.1:' + otherPort
