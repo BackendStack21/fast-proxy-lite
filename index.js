@@ -183,6 +183,9 @@ function fastProxy (opts = {}) {
         abort = request(reqParams, (err, response) => {
           settled = true
 
+          // remote response headers already copied to the client response
+          let copiedHeaders = null
+
           try {
             if (isClientGone(res)) {
               try {
@@ -232,6 +235,7 @@ function fastProxy (opts = {}) {
             try {
               // set origin response code
               res.statusCode = statusCode
+              copiedHeaders = resHeaders
               copyHeaders(resHeaders, res)
             } catch (err) {
               // the remote response can't be represented to the client, e.g:
@@ -258,6 +262,12 @@ function fastProxy (opts = {}) {
               response.stream.destroy()
             }
             if (!isClientGone(res)) {
+              if (copiedHeaders !== null) {
+                // The remote headers describe the remote payload, not the error
+                // sent here: a stale "content-length" would desynchronize the
+                // client connection, "cache-control" would make the error cacheable.
+                removeHeaders(copiedHeaders, res)
+              }
               sendError(res, 500, 'Internal Server Error')
             }
             process.emitWarning(err instanceof Error ? err : String(err))

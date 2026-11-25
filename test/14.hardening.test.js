@@ -1155,6 +1155,8 @@ describe('Hardening: failing hooks', () => {
   before(async () => {
     remote = http.createServer((req, res) => {
       req.socket.once('close', () => { remoteClosed++ })
+      res.setHeader('x-remote', 'true')
+      res.setHeader('cache-control', 'public, max-age=3600')
       res.end(Buffer.alloc(1024 * 1024))
     })
     const remotePort = await listen(remote);
@@ -1196,6 +1198,18 @@ describe('Hardening: failing hooks', () => {
     expect(res.status).to.equal(500)
     expect(remoteClosed).to.equal(1)
     expect(warnings.map(w => w.message)).to.deep.equal(['boom onResponse'])
+  })
+
+  it('should not send the remote response headers when onResponse throws', async () => {
+    const res = await send({ onResponse: () => { throw new Error('boom onResponse') } })
+
+    expect(res.status).to.equal(500)
+    expect(res.body).to.include('Internal Server Error')
+    // the remote "content-length" (1MB) does not describe the error payload
+    const head = res.data.slice(0, res.data.indexOf('\r\n\r\n')).toLowerCase()
+    expect(head).to.not.include('content-length')
+    expect(head).to.not.include('x-remote')
+    expect(head).to.not.include('cache-control')
   })
 
   it('should release the remote connection when onClientConnectionTerminated throws', async () => {
