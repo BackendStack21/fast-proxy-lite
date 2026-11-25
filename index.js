@@ -6,13 +6,21 @@ const Stream = require('stream')
 const buildRequest = require('./lib/request')
 
 const {
-  filterPseudoHeaders,
+  buildRequestHeaders,
   copyHeaders,
   stripHttp1ConnectionHeaders,
-  filterHeaders,
+  isValidContentLength,
+  isFormUrlEncoded,
+  isEmptyPlainObject,
+  toFormUrlEncoded,
   buildURL,
   populateHeaders
 } = require('./lib/utils')
+
+const { createError } = buildRequest
+
+const LOWER_CASE = /[a-z]/
+const NGHTTP2_INTERNAL_ERROR = 0x02
 
 function fastProxy (opts = {}) {
   const { request, close } = buildRequest({
@@ -21,6 +29,7 @@ function fastProxy (opts = {}) {
 
   const cache = getCacheStorage(opts.cacheURLs)
   const base = opts.base
+  const baseCachePrefix = getCachePrefix(base)
 
   return {
     close,
@@ -32,18 +41,51 @@ function fastProxy (opts = {}) {
       const rewriteHeaders = opts.rewriteHeaders || rewriteHeadersNoOp
       const rewriteRequestHeaders = opts.rewriteRequestHeaders || rewriteRequestHeadersNoOp
 
-      let url
-      try {
-        url = getReqUrl(source || req.url, cache, base, opts)
-      } catch (err) {
-        res.statusCode = 400
-        res.end('Bad Request')
+      if (isClientGone(res)) {
+        // nobody is waiting for a response, e.g: the client went away while
+        // asynchronous middlewares were running. The 'close' event was
+        // already emitted, the remote request could not be aborted later on.
+        onClientConnectionTerminated(res, createError('Client connection terminated', 'ECONNRESET'))
+
         return
       }
-      const sourceHttp2 = req.httpVersionMajor === 2
-      let headers = { ...sourceHttp2 ? filterPseudoHeaders(req.headers) : req.headers }
 
-      if (!headers.host) {
+      const method = req.method
+      if (method === 'CONNECT') {
+        // tunnels are not supported
+        sendError(res, 405, 'Method Not Allowed')
+
+        return
+      }
+      if (LOWER_CASE.test(method)) {
+        // Methods are case-sensitive, but http clients send them in upper case.
+        // HTTP/2 servers do accept "delete" as a method name: forwarding it as
+        // "DELETE" would bypass any method based access control.
+        sendError(res, 400, 'Bad Request')
+
+        return
+      }
+
+      let url
+      try {
+        url = opts.base
+          ? getReqUrl(source || req.url, cache, opts.base, getCachePrefix(opts.base))
+          : getReqUrl(source || req.url, cache, base, baseCachePrefix)
+      } catch (err) {
+        sendError(res, 400, 'Bad Request')
+
+        return
+      }
+
+      const reqHeaders = req.headers
+      const sourceHttp2 = req.httpVersionMajor === 2
+
+      // An intermediary that converts an HTTP/2 request to HTTP/1.1
+      // MUST create a Host header field if one is not present in a request
+      // by copying the value of the :authority pseudo-header field.
+      // see: https://httpwg.org/specs/rfc7540.html
+      const host = reqHeaders.host || (sourceHttp2 ? reqHeaders[':authority'] : undefined)
+      if (!host) {
         // https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Host
         // @TODO: Should add performance-aware host header value validation(regex-based) as a further step?
         res.statusCode = 400
@@ -52,94 +94,202 @@ function fastProxy (opts = {}) {
         return
       }
 
-      headers['x-forwarded-host'] = headers.host
-      headers.host = url.hostname
-      if (url.port) {
-        headers.host += `:${url.port}`
-      }
-
-      const qs = getQueryString(url.search, req.url, opts)
+      let headers = buildRequestHeaders(reqHeaders)
+      headers.host = url.host
+      headers['x-forwarded-host'] = host
 
       let body = null
+      let streaming = false
       // according to https://tools.ietf.org/html/rfc2616#section-4.3
       // proxy should ignore message body when it's a GET or HEAD request
-      // when proxy this request, we should reset the content-length to make it a valid http request
-      if (req.method === 'GET' || req.method === 'HEAD') {
-        if (headers['content-length']) {
-          headers = filterHeaders(headers, 'content-length')
-        }
-      } else {
-        if (req.body) {
-          if (req.body instanceof Stream) {
-            body = req.body
-          } else if (typeof req.body === 'string') {
-            body = req.body
-            populateHeaders(headers, body, 'text/plain')
-          } else if (headers['content-type'] === 'application/x-www-form-urlencoded') {
-            body = new URLSearchParams(req.body).toString()
-            populateHeaders(headers, body, 'application/x-www-form-urlencoded')
-          } else {
-            body = JSON.stringify(req.body)
-            populateHeaders(headers, body, 'application/json')
-          }
-        } else {
+      // when proxy this request, the message framing headers are not forwarded to make it a valid http request
+      if (method !== 'GET' && method !== 'HEAD') {
+        body = req.body
+        if (body === undefined || body === null) {
           body = req
+        } else if (body instanceof Stream) {
+          // forwarded as is
+        } else if (typeof body === 'object' && req.readableEnded === false && isEmptyPlainObject(body)) {
+          // body parsers commonly assign an empty object as "req.body" when the
+          // request payload was not parsed (e.g: unsupported content-type), in
+          // such case the payload is still unread and has to be streamed
+          body = req
+        } else {
+          try {
+            body = serializeBody(body, headers, reqHeaders)
+          } catch (err) {
+            // the payload can't be serialized: BigInt values, cyclic structures...
+            sendError(res, 400, 'Bad Request')
+
+            return
+          }
         }
+
+        if (body instanceof Stream) {
+          // The framing of the remote request is explicitly defined here, it
+          // must never be left to the http client defaults: a body written to
+          // a request with neither "content-length" nor "transfer-encoding"
+          // is sent unframed, and would be parsed as a second (smuggled)
+          // request by the remote server.
+          if (body !== req) {
+            // The framing headers of the client request describe the client
+            // payload, not this stream (e.g: a decompressed version of it).
+            // Bytes exceeding a wrong content-length would be parsed as a
+            // second request by the remote server.
+            headers['transfer-encoding'] = 'chunked'
+            streaming = true
+          } else if (req.readableEnded === true) {
+            // an already consumed request has nothing left to forward
+            body = null
+          } else if (reqHeaders['transfer-encoding'] !== undefined) {
+            // the incoming server already decoded the chunked payload
+            headers['transfer-encoding'] = 'chunked'
+            streaming = true
+          } else if (isValidContentLength(reqHeaders['content-length'])) {
+            headers['content-length'] = reqHeaders['content-length']
+            streaming = true
+          } else if (!sourceHttp2) {
+            // an HTTP/1 request with no framing headers has no payload
+            body = null
+          } else {
+            headers['transfer-encoding'] = 'chunked'
+            streaming = true
+          }
+        }
+      }
+
+      headers = rewriteRequestHeaders(req, headers) || headers
+      if (headers['transfer-encoding'] !== undefined) {
+        // both headers must never be sent, "transfer-encoding" takes precedence
+        if (headers['content-length'] !== undefined) {
+          delete headers['content-length']
+        }
+      } else if (streaming && !hasFramingHeaders(headers)) {
+        headers['transfer-encoding'] = 'chunked'
       }
 
       const reqParams = {
-        method: req.method,
+        method,
         url,
-        qs,
-        headers: rewriteRequestHeaders(req, headers),
+        qs: getQueryString(url.search, req.url, opts),
+        headers,
         body,
         request: reqOpts
       }
-      request(reqParams, (err, response) => {
-        if (!res.socket || res.socket.destroyed || res.writableEnded) {
-          return onClientConnectionTerminated(res, err, response)
-        }
 
-        if (err) {
-          if (err.code === 'ECONNREFUSED') {
-            res.statusCode = 503
-            res.end('Service Unavailable')
-          } else if (
-            err.code === 'ECONNRESET' ||
-            err.code === 'UND_ERR_HEADERS_TIMEOUT' ||
-            err.code === 'UND_ERR_BODY_TIMEOUT') {
-            res.statusCode = 504
-            res.end('Gateway Timeout')
-          } else {
-            res.statusCode = 500
-            res.end('Bad Gateway')
+      let settled = false
+      let abort
+      try {
+        abort = request(reqParams, (err, response) => {
+          settled = true
+
+          // remote response headers already copied to the client response
+          let copiedHeaders = null
+
+          try {
+            if (isClientGone(res)) {
+              try {
+                onClientConnectionTerminated(res, err, response)
+              } finally {
+                // an unconsumed response would hold the remote connection forever
+                if (response && response.stream && response.stream.readableFlowing === null) {
+                  response.stream.destroy()
+                }
+              }
+
+              return
+            }
+
+            if (err) {
+              if (err.code === 'ECONNREFUSED') {
+                sendError(res, 503, 'Service Unavailable')
+              } else if (
+                err.code === 'ECONNRESET' ||
+                err.code === 'ETIMEDOUT' ||
+                err.code === 'ESOCKETTIMEDOUT' ||
+                err.code === 'UND_ERR_HEADERS_TIMEOUT' ||
+                err.code === 'UND_ERR_BODY_TIMEOUT') {
+                sendError(res, 504, 'Gateway Timeout')
+              } else {
+                sendError(res, 502, 'Bad Gateway')
+              }
+
+              return
+            }
+
+            // destructing response from remote
+            const { headers, statusCode, stream } = response
+
+            if (!isValidStatusCode(statusCode)) {
+              stream.destroy()
+              sendError(res, 502, 'Bad Gateway')
+
+              return
+            }
+
+            // Strip hop-by-hop headers for all responses (HTTP/1.1 and HTTP/2).
+            // Per RFC 7230 §6.1, hop-by-hop headers MUST NOT be forwarded by proxies.
+            const safeHeaders = stripHttp1ConnectionHeaders(headers)
+            const resHeaders = rewriteHeaders(safeHeaders) || safeHeaders
+
+            try {
+              // set origin response code
+              res.statusCode = statusCode
+              copiedHeaders = resHeaders
+              copyHeaders(resHeaders, res)
+            } catch (err) {
+              // the remote response can't be represented to the client, e.g:
+              // invalid header values, status codes not allowed in HTTP/2
+              stream.destroy()
+              removeHeaders(resHeaders, res)
+              sendError(res, 502, 'Bad Gateway')
+
+              return
+            }
+
+            if (onResponse) {
+              onResponse(req, res, stream)
+            } else {
+              if (sourceHttp2) {
+                resetHttp2StreamOnFailure(stream, res)
+              }
+              pump(stream, res)
+            }
+          } catch (err) {
+            // A hook threw. This callback runs outside of the caller stack, the
+            // error can't be propagated: it would be an uncaught exception.
+            if (response && response.stream && !response.stream.destroyed) {
+              response.stream.destroy()
+            }
+            if (!isClientGone(res)) {
+              if (copiedHeaders !== null) {
+                // The remote headers describe the remote payload, not the error
+                // sent here: a stale "content-length" would desynchronize the
+                // client connection, "cache-control" would make the error cacheable.
+                removeHeaders(copiedHeaders, res)
+              }
+              sendError(res, 500, 'Internal Server Error')
+            }
+            process.emitWarning(err instanceof Error ? err : String(err))
           }
+        })
+      } catch (err) {
+        // the request can't be represented to the remote server:
+        // invalid header name/value, invalid path characters...
+        settled = true
+        sendError(res, 400, 'Bad Request')
 
-          return
-        }
+        return
+      }
 
-        // destructing response from remote
-        const { headers, statusCode, stream } = response
-
-        // Strip hop-by-hop headers for all responses (HTTP/1.1 and HTTP/2).
-        // Per RFC 7230 §6.1, hop-by-hop headers MUST NOT be forwarded by proxies.
-        const safeHeaders = stripHttp1ConnectionHeaders(headers)
-
-        if (sourceHttp2) {
-          copyHeaders(rewriteHeaders(safeHeaders), res)
-        } else {
-          copyHeaders(rewriteHeaders(safeHeaders), res)
-        }
-
-        // set origin response code
-        res.statusCode = statusCode
-
-        if (onResponse) {
-          onResponse(req, res, stream)
-        } else {
-          pump(stream, res)
-        }
-      })
+      if (!settled) {
+        // do not keep the remote server busy when nobody is waiting for the response
+        res.on('close', () => {
+          if (!settled) {
+            abort(createError('Client connection terminated', 'ECONNRESET'))
+          }
+        })
+      }
     }
   }
 }
@@ -155,10 +305,117 @@ function getQueryString (search, reqUrl, opts) {
 
   const queryIndex = reqUrl.indexOf('?')
   if (queryIndex > 0) {
-    return reqUrl.slice(queryIndex)
+    const hashIndex = reqUrl.indexOf('#')
+    if (hashIndex === -1) {
+      return reqUrl.slice(queryIndex)
+    }
+    if (hashIndex > queryIndex) {
+      return reqUrl.slice(queryIndex, hashIndex)
+    }
   }
 
   return ''
+}
+
+function serializeBody (body, headers, reqHeaders) {
+  if (typeof body === 'string') {
+    populateHeaders(headers, body, 'text/plain')
+  } else if (Buffer.isBuffer(body) || ArrayBuffer.isView(body)) {
+    if (!Buffer.isBuffer(body)) {
+      body = Buffer.from(body.buffer, body.byteOffset, body.byteLength)
+    }
+    populateHeaders(headers, body, 'application/octet-stream')
+
+    // Raw payloads are either untouched, or decoded by the body parser. The
+    // "content-encoding" header only applies to the former, in which case the
+    // payload length still matches the one announced by the client.
+    const contentLength = reqHeaders['content-length']
+    if (!isValidContentLength(contentLength) || Number(contentLength) === body.length) {
+      return body
+    }
+  } else if (typeof body === 'object' && isFormUrlEncoded(headers['content-type'])) {
+    body = toFormUrlEncoded(body)
+    populateHeaders(headers, body, 'application/x-www-form-urlencoded')
+  } else {
+    body = JSON.stringify(body) || ''
+    populateHeaders(headers, body, 'application/json')
+  }
+
+  // the payload was decoded by a body parser, it is forwarded as plain content
+  if (headers['content-encoding'] !== undefined) {
+    delete headers['content-encoding']
+  }
+
+  return body
+}
+
+// When the remote response fails midway, the HTTP/2 stream has to be reset.
+// Destroying the response (what pump does) ends the stream gracefully, the
+// client would not be able to tell that the payload is incomplete.
+function resetHttp2StreamOnFailure (stream, res) {
+  const reset = () => {
+    const http2Stream = res.stream
+    if (http2Stream && !http2Stream.destroyed) {
+      http2Stream.close(NGHTTP2_INTERNAL_ERROR)
+    }
+  }
+
+  stream.once('aborted', reset)
+  stream.once('error', reset)
+}
+
+function hasFramingHeaders (headers) {
+  if (headers['content-length'] !== undefined || headers['transfer-encoding'] !== undefined) {
+    return true
+  }
+
+  // slow path: header names in a different case
+  const keys = Object.keys(headers)
+  let name
+  for (let i = 0; i < keys.length; i++) {
+    name = keys[i].toLowerCase()
+    if (name === 'content-length' || name === 'transfer-encoding') {
+      return true
+    }
+  }
+
+  return false
+}
+
+function isClientGone (res) {
+  return !res.socket || res.socket.destroyed || res.writableEnded
+}
+
+function isValidStatusCode (statusCode) {
+  return (statusCode | 0) === statusCode && statusCode >= 100 && statusCode <= 999
+}
+
+function sendError (res, statusCode, message) {
+  if (res.headersSent) {
+    // the response was already started, the only way to signal the failure is
+    // to terminate the connection. Writing here would corrupt the payload.
+    res.destroy()
+
+    return
+  }
+
+  res.statusCode = statusCode
+  res.end(message)
+}
+
+function removeHeaders (headers, res) {
+  if (res.headersSent) {
+    return
+  }
+
+  const headersKeys = Object.keys(headers)
+  for (let i = 0; i < headersKeys.length; i++) {
+    try {
+      res.removeHeader(headersKeys[i])
+    } catch (err) {
+      // invalid header name, it was never set
+    }
+  }
 }
 
 function rewriteHeadersNoOp (headers) {
@@ -181,22 +438,42 @@ function getCacheStorage (size) {
   return lru(size || 100)
 }
 
-function getReqUrl (source, cache, base, opts) {
-  const reqBase = opts.base || base
-  let url
+// The cache key must not allow two different (base, source) pairs to collide,
+// the base is therefore length-prefixed. Sources used without a base are only
+// cached when they are valid absolute URLs, which can't start with a digit.
+function getCachePrefix (reqBase) {
+  return reqBase ? reqBase.length + ':' + reqBase : ''
+}
 
-  if (cache) {
-    const cacheKey = reqBase + source
-    url = cache.get(cacheKey)
-    if (!url) {
-      url = buildURL(source, reqBase)
-      cache.set(cacheKey, url)
-    }
-  } else {
-    url = buildURL(source, reqBase)
+function getReqUrl (source, cache, reqBase, cachePrefix) {
+  if (cache === null) {
+    return toTarget(buildURL(source, reqBase))
+  }
+
+  const cacheKey = cachePrefix + source
+  let url = cache.get(cacheKey)
+  if (url === undefined) {
+    url = toTarget(buildURL(source, reqBase))
+    cache.set(cacheKey, url)
   }
 
   return url
+}
+
+// URL getters are computed on every access, the request target is cached as a
+// plain object instead.
+function toTarget (url) {
+  const hostname = url.hostname
+
+  return {
+    protocol: url.protocol,
+    host: url.host,
+    // IPv6 literals: brackets belong to the URL syntax, not to the address
+    hostname: hostname.charCodeAt(0) === 91 ? hostname.slice(1, -1) : hostname,
+    port: url.port,
+    pathname: url.pathname,
+    search: url.search
+  }
 }
 
 module.exports = fastProxy

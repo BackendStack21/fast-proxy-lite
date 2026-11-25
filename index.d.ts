@@ -1,45 +1,66 @@
 import * as Http from 'http';
+import * as Http2 from 'http2';
 import * as Https from 'https';
-import { Stream } from 'pump';
 
-export type Options = {
+/**
+ * HTTP client implementation, e.g: the `http`/`https` core modules or
+ * `follow-redirects/http`/`follow-redirects/https`.
+ */
+export type RequestClient = {
+  request(options: Https.RequestOptions, ...args: any[]): any;
+};
+
+/**
+ * Besides the options described here, any option supported by the `http.Agent`
+ * and `https.Agent` constructors is accepted (`maxFreeSockets`, `timeout`...).
+ */
+export type Options = Https.AgentOptions & {
   base?: string;
   cacheURLs?: number;
   requests?: {
-    http?: Http.Agent;
-    https?: Https.Agent;
+    http?: RequestClient;
+    https?: RequestClient;
   };
   keepAliveMsecs?: number;
   maxSockets?: number;
   rejectUnauthorized?: boolean;
 };
 
+export type ProxyRequest = Http.IncomingMessage | Http2.Http2ServerRequest;
+export type ProxyResponse = Http.ServerResponse | Http2.Http2ServerResponse;
+
 export type ProxyRequestResponse = {
-  statusCode: Number;
-  headers: Http.OutgoingHttpHeaders;
-  stream: Stream;
+  statusCode: number;
+  headers: Http.IncomingHttpHeaders;
+  stream: Http.IncomingMessage;
 };
 
 export type ProxyOptions = {
   base?: string;
-  onClientConnectionTerminated?(res: Http.ServerResponse, err: Error, response: ProxyRequestResponse): void;
-  onResponse?(req: Http.IncomingMessage, res: Http.ServerResponse, stream: Stream): void;
-  rewriteRequestHeaders?(req: Http.IncomingMessage, headers: Http.IncomingHttpHeaders): Http.IncomingHttpHeaders;
+  /**
+   * Called when the client connection is terminated before the remote
+   * response could be delivered. `response` is only defined if the remote
+   * server responded, in such case its stream is destroyed after this callback
+   * returns, unless it is being consumed.
+   */
+  onClientConnectionTerminated?(res: ProxyResponse, err: Error | null, response?: ProxyRequestResponse): void;
+  onResponse?(req: ProxyRequest, res: ProxyResponse, stream: Http.IncomingMessage): void;
+  rewriteRequestHeaders?(req: ProxyRequest, headers: Http.IncomingHttpHeaders): Http.IncomingHttpHeaders;
   rewriteHeaders?(headers: Http.OutgoingHttpHeaders): Http.OutgoingHttpHeaders;
-  request?: Http.RequestOptions;
-  queryString?: string;
+  request?: Https.RequestOptions;
+  queryString?: string | URLSearchParams | Record<string, any>;
 }
 
 export type FastProxy = {
   proxy(
-    originReq: Http.IncomingMessage,
-    originRes: Http.ServerResponse,
-    source: string,
+    originReq: ProxyRequest,
+    originRes: ProxyResponse,
+    source?: string | null,
     opts?: ProxyOptions
   ): void;
   close(): void;
 }
 
-declare function fastProxy(options?: Options): FastProxy
+export declare function fastProxy(options?: Options): FastProxy
 
 export default fastProxy
